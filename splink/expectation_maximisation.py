@@ -24,7 +24,14 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def count_agreement_patterns_sql(settings_obj: Settings):
+def count_agreement_patterns_sql(settings_obj: Settings, semi_supervised_flag=False):
+    
+    
+    if semi_supervised_flag:
+        semi_supervised_fields = ", semi_supervised_match_probability, semi_supervised_omega"
+    else:
+        semi_supervised_fields = ""
+
     """Count how many times each realized agreement pattern
     was observed across the blocked dataset."""
     gamma_cols = [cc._gamma_column_name for cc in settings_obj.comparisons]
@@ -32,47 +39,79 @@ def count_agreement_patterns_sql(settings_obj: Settings):
 
     sql = f"""
     select
-    {gamma_cols_expr},
+    {gamma_cols_expr} {semi_supervised_fields} ,
     count(*) as agreement_pattern_count
     from __splink__df_comparison_vectors
-    group by {gamma_cols_expr}
+    group by {gamma_cols_expr} {semi_supervised_fields}
     """
 
     return sql
 
 
-def compute_new_parameters_sql(settings_obj: Settings):
+def compute_new_parameters_sql(settings_obj: Settings, semi_supervised_flag=False):
     """compute m and u counts from the results of predict"""
     if getattr(settings_obj, "_estimate_without_term_frequencies", False):
         agreement_pattern_count = "agreement_pattern_count"
     else:
         agreement_pattern_count = "1"
+        
+    if semi_supervised_flag:
+        match_probability = "coalesce(semi_supervised_match_probability,match_probability)"
+        pair_weight = "coalesce(semi_supervised_omega,1)"
+    else:
+        match_probability = "match_probability"
+        pair_weight="1"
+
+
+  #  sql_template = """
+  #  select
+  #  {gamma_column} as comparison_vector_value,
+  #  sum(match_probability * {agreement_pattern_count}) as m_count,
+  #  sum((1-match_probability) * {agreement_pattern_count}) as u_count,
+  #  '{output_column_name}' as output_column_name
+  #  from __splink__df_predict
+  #  group by {gamma_column}
+  #  """
+   
 
     sql_template = """
     select
     {gamma_column} as comparison_vector_value,
-    sum(match_probability * {agreement_pattern_count}) as m_count,
-    sum((1-match_probability) * {agreement_pattern_count}) as u_count,
+    sum( {match_probability} * {pair_weight} * {agreement_pattern_count}) as m_count,
+    sum((1-{match_probability}) * {pair_weight} * {agreement_pattern_count}) as u_count,
     '{output_column_name}' as output_column_name
     from __splink__df_predict
     group by {gamma_column}
     """
+     
     union_sqls = [
         sql_template.format(
             gamma_column=cc._gamma_column_name,
             output_column_name=cc._output_column_name,
             agreement_pattern_count=agreement_pattern_count,
+            match_probability = match_probability,
+            pair_weight=pair_weight
         )
         for cc in settings_obj.comparisons
     ]
 
     # Probability of two random records matching
+    #    sql = f"""
+     #   select 0 as comparison_vector_value,
+      #         sum(match_probability * {agreement_pattern_count}) /
+      #             sum({agreement_pattern_count}) as m_count,
+      #         sum((1-match_probability) * {agreement_pattern_count}) /
+      #             sum({agreement_pattern_count}) as u_count,
+      #         '_probability_two_random_records_match' as output_column_name
+      #  from __splink__df_predict
+      #  """
+        
     sql = f"""
     select 0 as comparison_vector_value,
-           sum(match_probability * {agreement_pattern_count}) /
-               sum({agreement_pattern_count}) as m_count,
-           sum((1-match_probability) * {agreement_pattern_count}) /
-               sum({agreement_pattern_count}) as u_count,
+           sum( {match_probability} * {pair_weight} * {agreement_pattern_count}) /
+               sum({agreement_pattern_count} * {pair_weight}) as m_count,
+           sum((1-{match_probability}) * {pair_weight} * {agreement_pattern_count}) /
+               sum({agreement_pattern_count} *{pair_weight}) as u_count,
            '_probability_two_random_records_match' as output_column_name
     from __splink__df_predict
     """
@@ -160,7 +199,9 @@ def populate_m_u_from_lookup(
 ):
     cl = comparison_level
     c = comparison_level.comparison
-    if not em_training_session._training_fix_m_probabilities:
+    # We need to force estimation on for _comparisons_that_cannot_be_estimated because these are the comparisons related to the blocking rule.
+    # If they are not being used in the training session at all, they will not be here. 
+    if (not em_training_session._training_fix_m_probabilities) or (c in em_training_session._comparisons_that_cannot_be_estimated):
         try:
             m_probability = m_u_records_lookup[c._output_column_name][
                 cl._comparison_vector_value
@@ -170,7 +211,7 @@ def populate_m_u_from_lookup(
             m_probability = LEVEL_NOT_OBSERVED_TEXT
         cl.m_probability = m_probability
 
-    if not em_training_session._training_fix_u_probabilities:
+    if (not em_training_session._training_fix_u_probabilities) or (c in em_training_session._comparisons_that_cannot_be_estimated):
         try:
             u_probability = m_u_records_lookup[c._output_column_name][
                 cl._comparison_vector_value
@@ -230,6 +271,11 @@ def expectation_maximisation(
             [df_comparison_vector_values]
         )
 
+    if em_training_session._semi_supervised_table is not None or em_training_session._semi_supervised_rules is not None:
+        semi_supervised_flag = True
+    else:
+        semi_supervised_flag = False
+
     for i in range(1, max_iterations + 1):
         start_time = time.time()
 
@@ -238,17 +284,19 @@ def expectation_maximisation(
             sqls = predict_from_agreement_pattern_counts_sqls(
                 settings_obj,
                 sql_infinity_expression=linker._infinity_expression,
+                semi_supervised_flag = semi_supervised_flag
             )
         else:
             sqls = predict_from_comparison_vectors_sqls(
                 settings_obj,
                 sql_infinity_expression=linker._infinity_expression,
+                semi_supervised_flag=semi_supervised_flag
             )
 
         for sql in sqls:
             linker._enqueue_sql(sql["sql"], sql["output_table_name"])
 
-        sql = compute_new_parameters_sql(settings_obj)
+        sql = compute_new_parameters_sql(settings_obj, semi_supervised_flag)
         linker._enqueue_sql(sql, "__splink__m_u_counts")
         if settings_obj._estimate_without_term_frequencies:
             df_params = linker._execute_sql_pipeline([agreement_pattern_counts])

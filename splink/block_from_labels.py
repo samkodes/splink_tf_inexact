@@ -10,7 +10,7 @@ if TYPE_CHECKING:
 
 
 def block_from_labels(
-    linker: Linker, labels_table_name: str, include_clerical_match_score=False
+    linker: Linker, labels_table_name: str, include_clerical_match_score=False, include_colnames=None
 ):
     """Create pairwise record comparisons corresponding to the ID pairs in a labels
     table
@@ -61,7 +61,10 @@ def block_from_labels(
         join_condition_r = f"r.{unique_id_col} = df_labels.{unique_id_col}_r"
 
     if include_clerical_match_score:
-        clerical_match_score = ", clerical_match_score"
+        if include_colnames is None:
+            clerical_match_score = ", clerical_match_score"
+        else:
+            clerical_match_score = ", " + ", ".join(include_colnames)
     else:
         clerical_match_score = ""
 

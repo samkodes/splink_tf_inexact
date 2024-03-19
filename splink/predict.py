@@ -15,6 +15,7 @@ def predict_from_comparison_vectors_sqls(
     threshold_match_weight=None,
     include_clerical_match_score=False,
     sql_infinity_expression="'infinity'",
+    semi_supervised_flag = False
 ) -> list[dict]:
     sqls = []
 
@@ -25,9 +26,14 @@ def predict_from_comparison_vectors_sqls(
         clerical_match_score = ", clerical_match_score"
     else:
         clerical_match_score = ""
-
+        
+    if semi_supervised_flag:
+        semi_supervised_fields = ", semi_supervised_match_probability, semi_supervised_omega"
+    else:
+        semi_supervised_fields = ""
+        
     sql = f"""
-    select {select_cols_expr} {clerical_match_score}
+    select {select_cols_expr} {clerical_match_score} {semi_supervised_fields}
     from __splink__df_comparison_vectors
     """
 
@@ -73,7 +79,7 @@ def predict_from_comparison_vectors_sqls(
     select
     log2({bayes_factor_expr}) as match_weight,
     {match_prob_expr} as match_probability,
-    {select_cols_expr} {clerical_match_score}
+    {select_cols_expr} {clerical_match_score} {semi_supervised_fields}
     from __splink__df_match_weight_parts
     {threshold_expr}
     {order_by_statement}
@@ -91,8 +97,16 @@ def predict_from_comparison_vectors_sqls(
 def predict_from_agreement_pattern_counts_sqls(
     settings_obj: Settings,
     sql_infinity_expression="'infinity'",
+    semi_supervised_flag = False
 ) -> list[dict]:
     sqls = []
+
+    if semi_supervised_flag:
+        semi_supervised_fields = ", semi_supervised_match_probability, semi_supervised_omega"
+    else:
+        semi_supervised_fields = ""
+
+
 
     select_cols = []
 
@@ -103,10 +117,10 @@ def predict_from_agreement_pattern_counts_sqls(
         select_cols.append(cc._gamma_column_name)
         select_cols.append(sql)
     select_cols.append("agreement_pattern_count")
-    select_cols_expr = ",".join(select_cols)
+    select_cols_expr = ",".join(select_cols) 
 
     sql = f"""
-    select {select_cols_expr}
+    select {select_cols_expr} {semi_supervised_fields}
     from __splink__agreement_pattern_counts
     """
 
@@ -135,7 +149,7 @@ def predict_from_agreement_pattern_counts_sqls(
     select
     log2({bayes_factor_expr}) as match_weight,
     {match_prob_expr} as match_probability,
-    {select_cols_expr}
+    {select_cols_expr} {semi_supervised_fields}
     from __splink__df_match_weight_parts
     """
 

@@ -4,7 +4,8 @@ import logging
 from copy import deepcopy
 from typing import TYPE_CHECKING
 
-from .blocking import BlockingRule, block_using_rules_sqls
+from .blocking import BlockingRule, block_using_rules_sqls, _sql_gen_where_condition
+from .block_from_labels import block_from_labels
 from .charts import (
     m_u_parameters_interactive_history_chart,
     match_weights_interactive_history_chart,
@@ -41,15 +42,41 @@ class EMTrainingSession:
         comparisons_to_deactivate: list[Comparison] = None,
         comparison_levels_to_reverse_blocking_rule: list[ComparisonLevel] = None,
         estimate_without_term_frequencies: bool = False,
+        semi_supervised_rules: list[dict] = None,
+        semi_supervised_table = None,
+        extend_block_by_ss_table: bool = False
     ):
         logger.info("\n----- Starting EM training session -----\n")
+
+        
+        
+
 
         self._original_settings_obj = linker._settings_obj
         self._original_linker = linker
         self._training_linker = deepcopy(linker)
+        
+        
+        # ss stuff
+        # register ss table and flag whether one exists
+        if semi_supervised_table is not None:
+            self._semi_supervised_table = self._training_linker.register_semi_supervised_table( semi_supervised_table, overwrite=True)
+            # REGISTER IT HERE
+        else:
+            self._semi_supervised_table = None
+        # store ss booleans and ss rules        
+        self._semi_supervised_rules = semi_supervised_rules
+        self._extend_block_by_ss_table = extend_block_by_ss_table
+
+
 
         self._settings_obj = self._training_linker._settings_obj
-        self._settings_obj._retain_matching_columns = False
+        
+        if semi_supervised_rules is not None:
+            self._settings_obj._retain_matching_columns = True # these may be needed for rules    
+        else:
+            self._settings_obj._retain_matching_columns = False
+        
         self._settings_obj._retain_intermediate_calculation_columns = False
         self._settings_obj._training_mode = True
 
@@ -59,6 +86,10 @@ class EMTrainingSession:
         self._settings_obj._blocking_rule_for_training = blocking_rule_for_training
         self._blocking_rule_for_training = blocking_rule_for_training
         self._settings_obj._estimate_without_term_frequencies = (
+   #         (semi_supervised_table is None)
+   #        and
+   #         (semi_supervised_rules is None)
+   #        and
             estimate_without_term_frequencies
         )
 
@@ -84,12 +115,20 @@ class EMTrainingSession:
         # Remove comparison columns which are either 'used up' by the blocking rules
         # or alternatively, if the user has manually provided a list to remove,
         # use this instead
-        if not comparisons_to_deactivate:
+        
+        
+        # edit to make "comparisons_to_deactivate" control EM, but "_comparisons_that_cannot_be_estimated" apply to overall model
+        # therefore user can specify the EM, but should not be allowed to specify what affects the overall model
+        
+        br_cols = get_columns_used_from_sql(
+                        blocking_rule_for_training.blocking_rule_sql,
+                        self._settings_obj._sql_dialect,
+                  )
+        
+        # if user does not specify, default behaviour is to omit all columns involved in blocking rule from EM
+        #if not comparisons_to_deactivate:
+        if comparisons_to_deactivate is None:  # allow user to specify empty list! distinguish between None and []!
             comparisons_to_deactivate = []
-            br_cols = get_columns_used_from_sql(
-                blocking_rule_for_training.blocking_rule_sql,
-                self._settings_obj._sql_dialect,
-            )
             for cc in self._settings_obj.comparisons:
                 cc_cols = cc._input_columns_used_by_case_statement
                 cc_cols = [c.input_name for c in cc_cols]
@@ -98,18 +137,38 @@ class EMTrainingSession:
         cc_names_to_deactivate = [
             cc._output_column_name for cc in comparisons_to_deactivate
         ]
+        
+        comparisons_that_cannot_be_estimated = []
+        for cc in self._settings_obj.comparisons:
+            cc_cols = cc._input_columns_used_by_case_statement
+            cc_cols = [c.input_name for c in cc_cols]
+            if set(br_cols).intersection(cc_cols):
+                comparisons_that_cannot_be_estimated.append(cc)
+        cc_names_to_deactivate_model = [
+            cc._output_column_name for cc in comparisons_that_cannot_be_estimated    
+        ]
+        
         self._comparisons_that_cannot_be_estimated: list[
             Comparison
-        ] = comparisons_to_deactivate
+        ] = comparisons_that_cannot_be_estimated
 
-        filtered_ccs = [
+        filtered_ccs_em = [
             cc
             for cc in self._settings_obj.comparisons
             if cc._output_column_name not in cc_names_to_deactivate
         ]
 
-        self._settings_obj.comparisons = filtered_ccs
-        self._comparisons_that_can_be_estimated = filtered_ccs
+        filtered_ccs_model = [
+            cc
+            for cc in self._settings_obj.comparisons
+            if cc._output_column_name not in cc_names_to_deactivate_model
+            
+        ]
+
+
+        self._settings_obj.comparisons = filtered_ccs_em
+                
+        self._comparisons_that_can_be_estimated = filtered_ccs_model
 
         self._settings_obj_history = []
 
@@ -161,18 +220,127 @@ class EMTrainingSession:
             self._original_linker, "repartition_after_blocking", False
         )
 
-        if repartition_after_blocking:
+        if repartition_after_blocking or ( self._extend_block_by_ss_table and self._semi_supervised_table is not None):
             df_blocked = self._training_linker._execute_sql_pipeline([nodes_with_tf])
             input_dataframes = [nodes_with_tf, df_blocked]
         else:
             input_dataframes = [nodes_with_tf]
+        
+        # semi-supervised stuff: extend blocks before computing comparison vectors if necessary! 
+               
+        if self._extend_block_by_ss_table and self._semi_supervised_table is not None:
+           sqls = self._extend_block_by_table_sqls( self._semi_supervised_table  )
+           # debug
+           print(sqls)
+           for sql in sqls:
+               self._training_linker._enqueue_sql(sql["sql"], sql["output_table_name"])
+           # have to execute queue now to update blocked df because of blocked df naming issue - can't have two tables with same name in same WITH clause
+           df_blocked = self._training_linker._execute_sql_pipeline(input_dataframes)
+           input_dataframes = [nodes_with_tf, df_blocked]
+
 
         sql = compute_comparison_vector_values_sql(self._settings_obj)
+        # debug
+        print(sql)
+        
         self._training_linker._enqueue_sql(sql, "__splink__df_comparison_vectors")
         return self._training_linker._execute_sql_pipeline(input_dataframes)
 
+
+    
+    def _extend_block_by_table_sqls(self,table):
+        # use existing  block_from_labels function, but modify output table name to make distinctly addressible
+        labels_sqls = block_from_labels( self._training_linker, 
+                                          table.physical_name)
+        labels_sqls[-1]["output_table_name"] = "__splink__df_blocked_extension"
+        
+        # take simple union (which omits duplicates) with existing blocked table
+        union_sql = {"sql": "(select * from __splink__df_blocked) UNION (select * from __splink__df_blocked_extension)",
+                     "output_table_name": "__splink__df_blocked"}
+        
+        labels_sqls.append( union_sql)
+        return labels_sqls
+
+
+    def _apply_semi_supervised_labels(self, cvv):
+        
+        if self._semi_supervised_table is not None:
+            
+            # use existing  block_from_labels function, but modify output table name for clarity
+            labels_sqls = block_from_labels( self._training_linker, 
+                                            self._semi_supervised_table.physical_name,    
+                                            include_clerical_match_score=True, 
+                                            include_colnames=["semi_supervised_match_probability","semi_supervised_omega"])  
+            labels_sqls[-1]["output_table_name"] = "__splink__df_semi_supervised_labels"
+            for sql in labels_sqls:
+                self._training_linker._enqueue_sql(sql["sql"], sql["output_table_name"])
+            # we don't actually need the fully blocked table here, but we used this function to get left and right correct 
+            # now we can do a simple left join to the existing comparison vector table to label
+            
+            unique_id_col = self._training_linker._settings_obj._unique_id_column_name
+            # check whether source dataset name is required
+            
+            if self._training_linker._settings_obj._source_dataset_column_name_is_required:
+                source_dataset_col = self._training_linker._settings_obj._source_dataset_column_name
+
+                join_condition_l = f"""
+                cv.{source_dataset_col}_l = ssl.{source_dataset_col}_l and
+                cv.{unique_id_col}_l = ssl.{unique_id_col}_l
+                """
+                join_condition_r = f"""
+                cv.{source_dataset_col}_r = ssl.{source_dataset_col}_r and
+                cv.{unique_id_col}_r = ssl.{unique_id_col}_r
+                """
+            else:
+                join_condition_l = f"cv.{unique_id_col}_l = ssl.{unique_id_col}_l"
+                join_condition_r = f"cv.{unique_id_col}_r = ssl.{unique_id_col}_r"
+
+            
+            table_sql = {"sql": f"""
+                          select cv.*,  ssl.semi_supervised_match_probability, ssl.semi_supervised_omega  
+                          from __splink__df_comparison_vectors cv
+                          left join __splink__df_semi_supervised_labels ssl
+                          on ({join_condition_l}) and ({join_condition_r})
+                          """,
+                         "output_table_name": "__splink__df_comparison_vectors"}
+                       
+            self._training_linker._enqueue_sql(table_sql["sql"], table_sql["output_table_name"])
+            nodes_with_tf = self._original_linker._initialise_df_concat_with_tf()# required for block_from_labels call
+            cvv = self._training_linker._execute_sql_pipeline([cvv,nodes_with_tf]) # execute so can update cvv via rules in next step if needed
+        
+        if self._semi_supervised_rules is not None:
+           if self._semi_supervised_table is not None:
+               else_prob_str = "semi_supervised_match_probability"
+               else_omega_str = "semi_supervised_omega"
+           else: 
+               else_prob_str = "NULL"
+               else_omega_str = "NULL"
+           probs_sqls = [f" WHEN ({r['sql']}) THEN {r['match_probability']} " for r in self._semi_supervised_rules]
+           omegas_sqls = [f" WHEN ({r['sql']}) THEN {r['omega']} " for r in self._semi_supervised_rules]
+           prob_select = "CASE " + " ".join(probs_sqls) + f"ELSE {else_prob_str} END AS semi_supervised_match_probability" 
+           omega_select = "CASE " + " ".join(omegas_sqls) + f"ELSE {else_omega_str} END AS semi_supervised_omega" 
+           
+           rules_sql = {"sql":"select *, " + prob_select +", " + omega_select + " from __splink__df_comparison_vectors", 
+                        "output_table_name": "__splink__df_comparison_vectors" }
+           self._training_linker._enqueue_sql(rules_sql["sql"], rules_sql["output_table_name"])
+           cvv = self._training_linker._execute_sql_pipeline([cvv])
+        
+           
+        return cvv
+            
+            
+
     def _train(self):
         cvv = self._comparison_vectors()
+        
+        # debug
+        cvv_df=cvv.as_pandas_dataframe()
+        print(cvv_df.columns)
+        
+        # semi-supervised stuff: label now!
+        if self._semi_supervised_rules is not None or self._semi_supervised_table is not None:
+            cvv = self._apply_semi_supervised_labels(cvv)            
+            
 
         # check that the blocking rule actually generates _some_ record pairs,
         # if not give the user a helpful message
@@ -199,8 +367,13 @@ class EMTrainingSession:
         rule = self._blocking_rule_for_training.blocking_rule_sql
         training_desc = f"EM, blocked on: {rule}"
 
+        #debug
+        print("Adding estimates for comparisons to model:")
+        print(self._comparisons_that_can_be_estimated)
+
         # Add m and u values to original settings
-        for cc in self._settings_obj.comparisons:
+        #for cc in self._settings_obj.comparisons:
+        for cc in  self._comparisons_that_can_be_estimated:
             orig_cc = self._original_settings_obj._get_comparison_by_output_column_name(
                 cc._output_column_name
             )
