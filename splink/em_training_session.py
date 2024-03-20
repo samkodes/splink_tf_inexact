@@ -309,10 +309,16 @@ class EMTrainingSession:
             cvv = self._training_linker._execute_sql_pipeline([cvv,nodes_with_tf]) # execute so can update cvv via rules in next step if needed
         
         if self._semi_supervised_rules is not None:
+           # messy logic below is needed to deal with case where we have both rules and a table
            if self._semi_supervised_table is not None:
                else_prob_str = "semi_supervised_match_probability"
                else_omega_str = "semi_supervised_omega"
+               if self._training_linker._sql_dialect == 'duckdb':
+                   select_str = "select * EXCLUDE(semi_supervised_match_probability,semi_supervised_omega) "
+               else:
+                   select_str = "select * EXCEPT(semi_supervised_match_probability,semi_supervised_omega) "
            else: 
+               select_str = "select * "
                else_prob_str = "NULL"
                else_omega_str = "NULL"
            probs_sqls = [f" WHEN ({r['sql']}) THEN {r['match_probability']} " for r in self._semi_supervised_rules]
@@ -320,7 +326,7 @@ class EMTrainingSession:
            prob_select = "CASE " + " ".join(probs_sqls) + f"ELSE {else_prob_str} END AS semi_supervised_match_probability" 
            omega_select = "CASE " + " ".join(omegas_sqls) + f"ELSE {else_omega_str} END AS semi_supervised_omega" 
            
-           rules_sql = {"sql":"select *, " + prob_select +", " + omega_select + " from __splink__df_comparison_vectors", 
+           rules_sql = {"sql":f"{select_str} , " + prob_select +", " + omega_select + " from __splink__df_comparison_vectors", 
                         "output_table_name": "__splink__df_comparison_vectors" }
            self._training_linker._enqueue_sql(rules_sql["sql"], rules_sql["output_table_name"])
            cvv = self._training_linker._execute_sql_pipeline([cvv])

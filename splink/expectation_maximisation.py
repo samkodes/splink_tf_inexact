@@ -263,18 +263,20 @@ def expectation_maximisation(
     max_iterations = settings_obj._max_iterations
     em_convergece = settings_obj._em_convergence
     logger.info("")  # newline
+    
+    if em_training_session._semi_supervised_table is not None or em_training_session._semi_supervised_rules is not None:
+        semi_supervised_flag = True
+    else:
+        semi_supervised_flag = False
 
     if settings_obj._estimate_without_term_frequencies:
-        sql = count_agreement_patterns_sql(settings_obj)
+        sql = count_agreement_patterns_sql(settings_obj,semi_supervised_flag)
         linker._enqueue_sql(sql, "__splink__agreement_pattern_counts")
         agreement_pattern_counts = linker._execute_sql_pipeline(
             [df_comparison_vector_values]
         )
 
-    if em_training_session._semi_supervised_table is not None or em_training_session._semi_supervised_rules is not None:
-        semi_supervised_flag = True
-    else:
-        semi_supervised_flag = False
+
 
     for i in range(1, max_iterations + 1):
         start_time = time.time()
